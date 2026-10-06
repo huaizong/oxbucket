@@ -1,4 +1,4 @@
-# s3rs — S3-compatible object storage in Rust
+# oxbucket — S3-compatible object storage in Rust
 
 Agent-built under the runner-harness long task. The human runs cargo
 build/test externally and feeds results back; you implement, verify by
