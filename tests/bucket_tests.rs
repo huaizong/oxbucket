@@ -31,7 +31,12 @@ fn spawn(port: u16) -> Child {
     panic!("server never came up on {port}");
 }
 
-struct Svc(Child, u16);
+struct Svc(Child);
+impl Svc {
+    fn new(port: u16) -> Self {
+        Svc(spawn(port))
+    }
+}
 impl Drop for Svc {
     fn drop(&mut self) {
         let _ = self.0.kill();
@@ -52,9 +57,7 @@ fn url(port: u16, path: &str) -> String {
 
 #[test]
 fn create_list_delete_bucket() {
-    let mut c = spawn(7411);
-    let svc = Svc { 0: std::mem::replace(&mut c, unsafe { std::mem::zeroed() }), 1: 7411 };
-    let _ = &svc;
+    let _svc = Svc::new(7411);
     let http = client();
     // create
     let r = http.put(url(7411, "/alpha")).send().unwrap();
@@ -78,9 +81,7 @@ fn create_list_delete_bucket() {
 
 #[test]
 fn delete_nonempty_bucket_conflicts() {
-    let mut c = spawn(7412);
-    let svc = Svc { 0: std::mem::replace(&mut c, unsafe { std::mem::zeroed() }), 1: 7412 };
-    let _ = &svc;
+    let _svc = Svc::new(7412);
     let http = client();
     http.put(url(7412, "/full")).send().unwrap();
     std::fs::write(
@@ -96,9 +97,7 @@ fn delete_nonempty_bucket_conflicts() {
 
 #[test]
 fn error_document_shape_on_unknown_bucket() {
-    let mut c = spawn(7413);
-    let svc = Svc { 0: std::mem::replace(&mut c, unsafe { std::mem::zeroed() }), 1: 7413 };
-    let _ = &svc;
+    let _svc = Svc::new(7413);
     let http = client();
     let r = http.get(url(7413, "/ghost/key")).send().unwrap();
     assert_eq!(r.status(), 404);
