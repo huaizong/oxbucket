@@ -381,7 +381,7 @@ fn amz_date_to_epoch(s: &str) -> Option<u64> {
 fn canonical_query_raw(raw: &str) -> String {
     let mut segments: Vec<&str> = raw
         .split('&')
-        .filter(|kv| !kv.is_empty() && kv != "X-Amz-Signature")
+        .filter(|kv| !kv.is_empty() && *kv != "X-Amz-Signature")
         .filter(|kv| !kv.starts_with("X-Amz-Signature="))
         .collect();
     segments.sort_unstable();
@@ -492,7 +492,7 @@ fn verify_query_auth(
             "The Credential scope date does not match X-Amz-Date",
         ));
     }
-    let issued_at = amz_date_to_epoch(amz_date).ok_or(AuthError::AccessDenied(
+    let issued_at = amz_date_to_epoch(&amz_date).ok_or(AuthError::AccessDenied(
         "Malformed X-Amz-Date; expected yyyymmddThhmmssZ",
     ))?;
     let expires_secs: u64 = expires.parse().map_err(|_| {
