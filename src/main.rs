@@ -1,6 +1,8 @@
-//! oxbucket — S3-compatible object storage server (stage 1: bucket CRUD).
+//! oxbucket — S3-compatible object storage server (stage 1: bucket CRUD,
+//! stage 2: SigV4 header auth).
 //!
-//! Stage 1 scope (path-style addressing only, auth not yet enforced):
+//! Stage 1 scope (path-style addressing; routes protected by the stage-2
+//! SigV4 middleware whenever credentials are configured via the environment):
 //! - PUT    /<bucket>        create bucket          -> 200 + `Location: /<bucket>`
 //! - HEAD   /<bucket>        bucket exists?         -> 200 / 404 (no body)
 //! - DELETE /<bucket>        delete *empty* bucket  -> 204; 409 BucketNotEmpty otherwise
@@ -32,6 +34,8 @@ use axum::{
     Router,
 };
 
+mod auth;
+
 const DEFAULT_PORT: u16 = 7333;
 const DEFAULT_DATA_DIR: &str = "./data";
 const XML_NS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
@@ -41,6 +45,8 @@ const XML_NS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 struct AppState {
     /// Root directory holding one sub-directory per bucket.
     data_dir: PathBuf,
+    /// SigV4 credentials and enforcement switch (stage 2).
+    auth: auth::Credentials,
 }
 
 #[tokio::main]
@@ -57,12 +63,26 @@ async fn main() {
     fs::create_dir_all(&data_dir)
         .unwrap_or_else(|e| panic!("cannot create data dir {}: {e}", data_dir.display()));
 
+    // Stage 2: read the credential pair. Auth is enforced when the operator
+    // configured at least one of S3RS_ACCESS_KEY / S3RS_SECRET_KEY; a bare
+    // default environment (tests spawning without credentials) keeps the
+    // open stage-1 behavior.
+    let credentials = auth::Credentials::from_env();
+
+    let state = AppState {
+        data_dir,
+        auth: credentials,
+    };
     let app = Router::new()
         .route("/", get(list_buckets))
         .route("/{bucket}", any(bucket_endpoint))
         .route("/{bucket}/{*key}", any(object_endpoint))
         .fallback(unknown_resource)
-        .with_state(AppState { data_dir });
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::authorize,
+        ))
+        .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
         .await
@@ -241,7 +261,7 @@ async fn unknown_resource(uri: Uri) -> Response {
 // ---------------------------------------------------------------------------
 
 /// An S3-shaped error: rendered as an XML `<Error>` document.
-struct ApiError {
+pub(crate) struct ApiError {
     status: StatusCode,
     code: &'static str,
     message: &'static str,
@@ -249,7 +269,7 @@ struct ApiError {
 }
 
 impl ApiError {
-    fn new(
+    pub(crate) fn new(
         status: StatusCode,
         code: &'static str,
         message: &'static str,
