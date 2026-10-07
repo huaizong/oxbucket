@@ -8,6 +8,24 @@
 mod common;
 use common::*;
 
+use hmac::{Hmac, Mac};
+use sha2::{Digest, Sha256};
+
+fn sha256_hex(data: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(data);
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn hmac(key: &[u8], msg: &[u8]) -> Vec<u8> {
+    let mut m = <Hmac<Sha256> as Mac>::new_from_slice(key).unwrap();
+    m.update(msg);
+    m.finalize().into_bytes().to_vec()
+}
+
+fn hex(b: &[u8]) -> String { b.iter().map(|x| format!("{x:02x}")).collect() }
+
+
 fn presign_get(port: u16, bucket: &str, key: &str, tamper: bool, expired: bool) -> String {
     let now = chrono::Utc::now() - if expired {
         chrono::Duration::hours(2)
