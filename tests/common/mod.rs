@@ -109,10 +109,28 @@ pub fn signed_request(
     signed_list.sort();
     let signed_headers = signed_list.join(";");
     let body_str = body.map(|b| String::from_utf8_lossy(b).to_string()).unwrap_or_default();
+    // SigV4: canonical URI is the path ONLY; the query string is a separate,
+    // sorted, URL-encoded component (k=v pairs joined by &).
+    let (raw_path, raw_query) = match path.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (path, None),
+    };
+    let canonical_query = raw_query
+        .map(|q| {
+            let mut pairs: Vec<(String, String)> = q.split('&').filter(|kv| !kv.is_empty()).map(|kv| {
+                match kv.split_once('=') {
+                    Some((k, v)) => (k.to_string(), v.to_string()),
+                    None => (kv.to_string(), String::new()),
+                }
+            }).collect();
+            pairs.sort();
+            pairs.iter().map(|(k, v)| format!("{}={}", aws_uri_encode(k), aws_uri_encode(v))).collect::<Vec<_>>().join("&")
+        })
+        .unwrap_or_default();
     let canonical_req = format!(
         "{method}
-{path}
-
+{raw_path}
+{canonical_query}
 {canonical_headers}
 {signed_headers}
 {payload_hash}");
@@ -133,5 +151,27 @@ pub fn signed_request(
         .header("Authorization", auth)
         .body(body_str)
         .send()
+        .map(|r| {
+            if !r.status().is_success() && r.status() != 404 {
+                // keep for debugging
+            }
+            r
+        })
         .unwrap()
+}
+
+/// AWS SigV4 URI encoding: everything unreserved (A-Za-z0-9 - _ . ~) stays,
+/// every other byte becomes %XX uppercase hex.
+#[allow(dead_code)]
+fn aws_uri_encode(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
