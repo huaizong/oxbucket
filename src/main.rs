@@ -15,8 +15,8 @@
 //! - `S3RS_DATA` — data directory (default ./data), created at startup
 //!
 //! Storage layout: one directory per bucket directly under the data dir.
-//! Objects (stage 3) will be files inside those directories plus sidecar
-//! `.meta.json` files.
+//! Objects are files inside those directories plus sidecar `.meta.json`
+//! files (stage 3: PUT/GET/HEAD/DELETE with md5 etags and content-types).
 
 use std::{
     env, fs,
@@ -26,15 +26,17 @@ use std::{
 };
 
 use axum::{
-    body::Body,
+    body::{Body, Bytes},
     extract::{Path, State},
-    http::{header, HeaderValue, Method, StatusCode, Uri},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::{any, get},
     Router,
 };
 
 mod auth;
+
+mod md5;
 
 const DEFAULT_PORT: u16 = 7333;
 const DEFAULT_DATA_DIR: &str = "./data";
@@ -226,23 +228,154 @@ fn get_bucket(state: &AppState, bucket: &str) -> Response {
     .into_response()
 }
 
-/// /<bucket>/<key> — object operations land in stage 3; until then an
-/// unknown bucket must still answer 404 NoSuchBucket.
+/// /<bucket>/<key> — object core (stage 3): PUT/GET/HEAD/DELETE. An unknown
+/// bucket answers 404 NoSuchBucket for every method; an unusable key is a
+/// 400 (the key guard doubles as the traversal guard, like the bucket-name
+/// validator).
 async fn object_endpoint(
+    method: Method,
     State(state): State<AppState>,
     Path((bucket, key)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Response {
-    let resource = format!("/{bucket}/{key}");
     if !is_valid_bucket_name(&bucket) || !bucket_dir(&state, &bucket).is_dir() {
-        return ApiError::no_such_bucket(resource).into_response();
+        return ApiError::no_such_bucket(format!("/{bucket}/{key}")).into_response();
     }
-    ApiError::new(
-        StatusCode::NOT_IMPLEMENTED,
-        "NotImplemented",
-        "Object operations are implemented in stage 3",
-        resource,
-    )
-    .into_response()
+    if !is_valid_key(&key) {
+        return ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "InvalidArgument",
+            "The specified key is not valid",
+            format!("/{bucket}/{key}"),
+        )
+        .into_response();
+    }
+    // Explicit dispatch, mirroring bucket_endpoint, so HEAD never falls back
+    // to the GET handler.
+    if method == Method::PUT {
+        let content_type = headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or(DEFAULT_CONTENT_TYPE)
+            .to_string();
+        put_object(&state, &bucket, &key, &body, &content_type)
+    } else if method == Method::GET {
+        get_object(&state, &bucket, &key, &format!("/{bucket}/{key}"))
+    } else if method == Method::HEAD {
+        head_object(&state, &bucket, &key, &format!("/{bucket}/{key}"))
+    } else if method == Method::DELETE {
+        delete_object(&state, &bucket, &key)
+    } else {
+        method_not_allowed(format!("/{bucket}/{key}"))
+    }
+}
+
+/// PUT /<bucket>/<key> — PutObject: store the bytes plus the sidecar
+/// `.meta.json` (etag + content-type), answer 200 with the ETag header.
+fn put_object(
+    state: &AppState,
+    bucket: &str,
+    key: &str,
+    body: &[u8],
+    content_type: &str,
+) -> Response {
+    let path = object_path(state, bucket, key);
+    // Nested keys ("a/b") live in sub-directories; create them on demand.
+    if let Some(parent) = path.parent() {
+        if let Err(err) = fs::create_dir_all(parent) {
+            return internal_error("could not create object directory", err);
+        }
+    }
+    if let Err(err) = fs::write(&path, body) {
+        return internal_error("could not write object", err);
+    }
+    let meta = ObjectMeta {
+        etag: md5::md5_hex(body),
+        content_type: content_type.to_string(),
+    };
+    if let Err(err) = write_meta(&meta_path(state, bucket, key), &meta) {
+        return internal_error("could not write object metadata", err);
+    }
+    let mut res = empty_response(StatusCode::OK);
+    res.headers_mut()
+        .insert(header::ETAG, quoted_etag(&meta.etag));
+    res
+}
+
+/// GET /<bucket>/<key> — GetObject: 200 with the stored bytes plus
+/// Content-Type and the quoted-md5 ETag; 404 NoSuchKey when absent.
+fn get_object(state: &AppState, bucket: &str, key: &str, resource: &str) -> Response {
+    let body = match fs::read(object_path(state, bucket, key)) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return ApiError::no_such_key(resource).into_response();
+        }
+        Err(err) => return internal_error("could not read object", err),
+    };
+    let meta = match read_meta(&meta_path(state, bucket, key)) {
+        Ok(meta) => meta,
+        Err(err) => return internal_error("could not read object metadata", err),
+    };
+    let mut res = Response::new(Body::from(body));
+    res.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_str(&meta.content_type)
+            .unwrap_or_else(|_| HeaderValue::from_static(DEFAULT_CONTENT_TYPE)),
+    );
+    res.headers_mut()
+        .insert(header::ETAG, quoted_etag(&meta.etag));
+    res
+}
+
+/// HEAD /<bucket>/<key> — HeadObject: the headers GET would send, no body.
+/// (Echoing the object size as Content-Length can wait for a later stage.)
+fn head_object(state: &AppState, bucket: &str, key: &str, resource: &str) -> Response {
+    let path = object_path(state, bucket, key);
+    if let Err(err) = fs::metadata(&path) {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            return ApiError::no_such_key(resource).into_response();
+        }
+        return internal_error("could not stat object", err);
+    }
+    let meta = match read_meta(&meta_path(state, bucket, key)) {
+        Ok(meta) => meta,
+        Err(err) => return internal_error("could not read object metadata", err),
+    };
+    let mut res = empty_response(StatusCode::OK);
+    res.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_str(&meta.content_type)
+            .unwrap_or_else(|_| HeaderValue::from_static(DEFAULT_CONTENT_TYPE)),
+    );
+    res.headers_mut()
+        .insert(header::ETAG, quoted_etag(&meta.etag));
+    res
+}
+
+/// DELETE /<bucket>/<key> — DeleteObject: 204, idempotent — deleting a key
+/// that does not exist is still 204, matching S3.
+fn delete_object(state: &AppState, bucket: &str, key: &str) -> Response {
+    let path = object_path(state, bucket, key);
+    if let Err(err) = fs::remove_file(&path) {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            return internal_error("could not delete object", err);
+        }
+    }
+    if let Err(err) = fs::remove_file(meta_path(state, bucket, key)) {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            return internal_error("could not delete object metadata", err);
+        }
+    }
+    // A nested key may leave its (now empty) parent directory behind; prune
+    // it so delete_bucket's BucketNotEmpty check stays truthful. Harmless
+    // when the parent is the bucket directory itself or still has siblings.
+    if let Some(parent) = path.parent() {
+        if parent != bucket_dir(state, bucket).as_path() {
+            let _ = fs::remove_dir(parent);
+        }
+    }
+    empty_response(StatusCode::NO_CONTENT)
 }
 
 /// Anything else — keep the pinned invariant that errors are XML documents.
@@ -288,6 +421,15 @@ impl ApiError {
             StatusCode::NOT_FOUND,
             "NoSuchBucket",
             "The specified bucket does not exist",
+            resource,
+        )
+    }
+
+    fn no_such_key(resource: impl Into<String>) -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            "NoSuchKey",
+            "The specified key does not exist",
             resource,
         )
     }
@@ -359,6 +501,121 @@ fn empty_response(status: StatusCode) -> Response {
 
 fn bucket_dir(state: &AppState, bucket: &str) -> PathBuf {
     state.data_dir.join(bucket)
+}
+
+/// Raw byte path of the object `key` inside `bucket`.
+fn object_path(state: &AppState, bucket: &str, key: &str) -> PathBuf {
+    bucket_dir(state, bucket).join(key)
+}
+
+/// Sidecar `.meta.json` path — the pinned storage layout keeps etag and
+/// content-type next to the object bytes. Stage-4 note: listings must skip
+/// these names.
+fn meta_path(state: &AppState, bucket: &str, key: &str) -> PathBuf {
+    let mut name = object_path(state, bucket, key).into_os_string();
+    name.push(".meta.json");
+    PathBuf::from(name)
+}
+
+/// Object-key rules, doubling as the traversal guard like
+/// `is_valid_bucket_name` above: reject empty keys, absolute paths, NULs,
+/// backslashes (a path separator on the Windows build) and any `..`
+/// component that could escape the bucket directory.
+fn is_valid_key(key: &str) -> bool {
+    if key.is_empty() || key.starts_with('/') || StdPath::new(key).is_absolute() {
+        return false;
+    }
+    if key.bytes().any(|b| b == 0 || b == b'\\') {
+        return false;
+    }
+    !key.split('/').any(|segment| segment == "..")
+}
+
+/// Content-type kept when a PUT carries no usable one (S3's binary default).
+const DEFAULT_CONTENT_TYPE: &str = "binary/octet-stream";
+
+/// The sidecar's payload: what GET/HEAD need beyond the raw bytes. Stored as
+/// a tiny fixed-shape JSON document that the server both writes and reads
+/// (`serde_json` is deliberately not a dependency).
+struct ObjectMeta {
+    etag: String,
+    content_type: String,
+}
+
+impl ObjectMeta {
+    fn to_json(&self) -> String {
+        format!(
+            "{{\"etag\":\"{}\",\"content_type\":\"{}\"}}",
+            json_escape(&self.etag),
+            json_escape(&self.content_type)
+        )
+    }
+
+    fn from_json(text: &str) -> Option<Self> {
+        Some(Self {
+            etag: json_string_field(text, "etag")?,
+            content_type: json_string_field(text, "content_type")?,
+        })
+    }
+}
+
+/// Escape a value for embedding in the sidecar JSON string literal. Etags
+/// are hex and content-types are visible ASCII, so the two mandatory
+/// escapes plus control characters cover everything.
+fn json_escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Read one `"field":"value"` pair back out of a sidecar written by
+/// [`ObjectMeta::to_json`], honoring its escapes.
+fn json_string_field(text: &str, field: &str) -> Option<String> {
+    let marker = format!("\"{field}\":\"");
+    let start = text.find(&marker)? + marker.len();
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut i = start;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => return String::from_utf8(out).ok(),
+            b'\\' => {
+                i += 1;
+                match bytes.get(i) {
+                    Some(b'"') => out.push(b'"'),
+                    Some(b'\\') => out.push(b'\\'),
+                    Some(b'n') => out.push(b'\n'),
+                    _ => return None,
+                }
+            }
+            b => out.push(b),
+        }
+        i += 1;
+    }
+    None
+}
+
+fn write_meta(path: &StdPath, meta: &ObjectMeta) -> std::io::Result<()> {
+    fs::write(path, meta.to_json())
+}
+
+fn read_meta(path: &StdPath) -> std::io::Result<ObjectMeta> {
+    let text = fs::read_to_string(path)?;
+    ObjectMeta::from_json(&text).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "malformed sidecar metadata")
+    })
+}
+
+/// ETag header value: lowercase md5 hex in double quotes.
+fn quoted_etag(etag: &str) -> HeaderValue {
+    HeaderValue::from_str(&format!("\"{etag}\"")).expect("md5 hex is a valid header value")
 }
 
 /// S3 bucket-name rules (the subset that matters here): 3-63 chars of
