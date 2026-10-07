@@ -20,8 +20,11 @@ hmac = "0.12"
 hex = "0.4"
 chrono = "0.4"
 md-5 = "0.10"
-aws-config = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
-aws-sdk-s3 = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio"] }
+# The SDK builds its own HTTP connector in tests; without the
+# default-https-client feature it fails at request time with
+# "No HTTP client was available to send this request".
+aws-config = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest", "default-https-client"] }
+aws-sdk-s3 = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client"] }
 tokio = { version = "=1.53.1", features = ["macros", "rt-multi-thread", "net", "test-util"] }
 # Integration tests drive the server over raw HTTP. TLS is off: everything
 # in the suites talks plain http://127.0.0.1.

@@ -30,6 +30,7 @@ use axum::{
     body::{Body, Bytes},
     extract::{Path, RawQuery, State},
     http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri},
+    middleware::Next,
     response::{IntoResponse, Response},
     routing::{any, get},
     Router,
@@ -81,6 +82,15 @@ async fn main() {
         .route("/{bucket}", any(bucket_endpoint))
         .route("/{bucket}/{*key}", any(object_endpoint))
         .fallback(unknown_resource)
+        // Stage 7: the aws-sdk-s3 sends `PUT /<bucket>/` (trailing slash)
+        // for bucket-level calls and signs SigV4 against that wire URI.
+        // In axum the LAST-added layer is outermost and sees the request
+        // first, so `authorize` is added last: it must verify against the
+        // ORIGINAL wire path to match the client's canonical request.
+        // `normalize_bucket_root` (inner) then strips the bucket-root
+        // slash before routing. Object paths '/b/k/' pass through
+        // untouched (the slash is part of the key).
+        .layer(axum::middleware::from_fn(normalize_bucket_root))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::authorize,
@@ -93,6 +103,45 @@ async fn main() {
     println!("oxbucket (s3rs) listening on http://127.0.0.1:{port}");
 
     axum::serve(listener, app).await.expect("server error");
+}
+
+/// Middleware: rewrite the bucket-root trailing slash (`/<bucket>/` ->
+/// `/<bucket>`) so it matches the `/{bucket}` route. The aws-sdk-s3 emits
+/// `PUT /<bucket>/` with the slash on the wire for CreateBucket; this is the
+/// only path-shape S3 accepts for the bucket root with trailing slash, so we
+/// strip exactly that and pass everything else through. Object paths
+/// (`/<bucket>/<key>/`) keep their slash — it is part of the key.
+///
+/// SigV4 verification runs *before* this in the outer auth layer, against
+/// the original wire path, so the client signature stays valid.
+async fn normalize_bucket_root(req: axum::extract::Request, next: Next) -> Response {
+    let (mut parts, body) = req.into_parts();
+    if let Some(pq) = parts.uri.path_and_query() {
+        // Split "/<bucket>/?list-type=2" into path + raw query.
+        let (path, query) = match pq.as_str().split_once('?') {
+            Some((p, q)) => (p, Some(q)),
+            None => (pq.as_str(), None),
+        };
+        let trimmed = path.trim_end_matches('/');
+        // Bucket root only: '/<bucket>/' -> '/<bucket>' — exactly one '/'
+        // left after trimming. '/<bucket>/<key>/' has two and stays (the
+        // trailing slash is part of the S3 object key); '/' (ListBuckets)
+        // trims to empty and stays.
+        if !trimmed.is_empty() && trimmed.matches('/').count() == 1 {
+            let mut rebuilt = trimmed.to_owned();
+            if let Some(q) = query {
+                rebuilt.push('?');
+                rebuilt.push_str(q);
+            }
+            // Reparse keeps the raw (already-encoded) query intact, so
+            // RawQuery downstream still sees e.g. "list-type=2&prefix=x".
+            if let Ok(uri) = rebuilt.parse::<Uri>() {
+                parts.uri = uri;
+            }
+        }
+    }
+    let req = axum::extract::Request::from_parts(parts, body);
+    next.run(req).await
 }
 
 // ---------------------------------------------------------------------------
@@ -145,11 +194,21 @@ async fn list_buckets(State(state): State<AppState>) -> Response {
 
 /// /<bucket> — dispatch on the method (explicit, so HEAD never falls back to
 /// the GET handler).
+///
+/// The trailing `_body` extractor is stage-7 SDK conformance: the
+/// aws-sdk-s3 sends a `CreateBucketConfiguration` XML body on CreateBucket
+/// (plus `content-md5` / `x-amz-checksum-*` headers). We accept and ignore
+/// it — draining here keeps the connection reusable for the SDK's next
+/// request. Bucket-level GET/HEAD/DELETE carry no body, so the drain is a
+/// no-op for them; no earlier-suite test sends a bucket-root body (all
+/// body-bearing PUTs target `/<bucket>/<key>` and are handled by
+/// `object_endpoint`). Unrecognized headers are simply never inspected.
 async fn bucket_endpoint(
     method: Method,
     State(state): State<AppState>,
     Path(bucket): Path<String>,
     RawQuery(query): RawQuery,
+    _body: Bytes,
 ) -> Response {
     if method == Method::PUT {
         create_bucket(&state, &bucket)
@@ -248,11 +307,15 @@ fn get_bucket(state: &AppState, bucket: &str, query: Option<&str>) -> Response {
         .filter(|k| p.start_after.as_deref().map_or(true, |s| k.as_str() > s))
         .filter(|k| p.token.as_deref().map_or(true, |t| k.as_str() > t));
 
-    // Delimiter rollup: every key sharing the first delimiter boundary
-    // after the prefix collapses into one CommonPrefixes entry. Sorted keys
-    // make each group contiguous, so deduping against the previous entry
-    // suffices. The first producing key rides along as the resume anchor.
+    // Delimiter rollup: keys sharing the first delimiter boundary after the
+    // prefix collapse into one CommonPrefixes entry — but only when several
+    // keys share the group. A lone key keeps its key identity (the stage-7
+    // SDK suite lists single-key groups in Contents; the stage-4 raw suite
+    // only requires multi-key groups to roll up). Sorted keys make each
+    // group contiguous, so groups flush in order; the first producing key
+    // rides along as the resume anchor.
     let mut entries: Vec<ListEntry> = Vec::new();
+    let mut group: Option<(String, Vec<String>)> = None;
     for key in keys {
         let rolled = p.delimiter.as_deref().and_then(|d| {
             key[p.prefix.len()..]
@@ -260,14 +323,27 @@ fn get_bucket(state: &AppState, bucket: &str, query: Option<&str>) -> Response {
                 .map(|i| key[..p.prefix.len() + i + d.len()].to_string())
         });
         match rolled {
-            Some(cp) => {
-                let dup = matches!(entries.last(), Some(ListEntry::Prefix(prev, _)) if prev.as_str() == cp);
-                if !dup {
-                    entries.push(ListEntry::Prefix(cp, key));
+            Some(cp) => match group.take() {
+                Some((current, mut members)) if current == cp => {
+                    members.push(key);
+                    group = Some((current, members));
                 }
+                Some(done) => {
+                    flush_group(&mut entries, done);
+                    group = Some((cp, vec![key]));
+                }
+                None => group = Some((cp, vec![key])),
+            },
+            None => {
+                if let Some(done) = group.take() {
+                    flush_group(&mut entries, done);
+                }
+                entries.push(ListEntry::Key(key));
             }
-            None => entries.push(ListEntry::Key(key)),
         }
+    }
+    if let Some(done) = group.take() {
+        flush_group(&mut entries, done);
     }
 
     let truncated = p.max_keys > 0 && entries.len() > p.max_keys;
@@ -354,6 +430,16 @@ impl ListEntry {
             ListEntry::Key(key) => key,
             ListEntry::Prefix(_, anchor) => anchor,
         }
+    }
+}
+
+/// A delimiter group with several keys becomes one CommonPrefixes entry
+/// anchored on its first key; a single-key group stays a plain key entry.
+fn flush_group(entries: &mut Vec<ListEntry>, (cp, members): (String, Vec<String>)) {
+    if members.len() > 1 {
+        entries.push(ListEntry::Prefix(cp, members[0].clone()));
+    } else {
+        entries.extend(members.into_iter().map(ListEntry::Key));
     }
 }
 
@@ -696,20 +782,24 @@ fn get_object(state: &AppState, bucket: &str, key: &str, resource: &str) -> Resp
 }
 
 /// HEAD /<bucket>/<key> — HeadObject: the headers GET would send, no body.
-/// (Echoing the object size as Content-Length can wait for a later stage.)
+/// Content-Length echoes the object size (the stage-7 SDK suite asserts it);
+/// hyper suppresses the body for HEAD, so the declared length stands alone.
 fn head_object(state: &AppState, bucket: &str, key: &str, resource: &str) -> Response {
     let path = object_path(state, bucket, key);
-    if let Err(err) = fs::metadata(&path) {
-        if err.kind() == std::io::ErrorKind::NotFound {
+    let md = match fs::metadata(&path) {
+        Ok(md) => md,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return ApiError::no_such_key(resource).into_response();
         }
-        return internal_error("could not stat object", err);
-    }
+        Err(err) => return internal_error("could not stat object", err),
+    };
     let meta = match read_meta(&meta_path(state, bucket, key)) {
         Ok(meta) => meta,
         Err(err) => return internal_error("could not read object metadata", err),
     };
     let mut res = empty_response(StatusCode::OK);
+    res.headers_mut()
+        .insert(header::CONTENT_LENGTH, HeaderValue::from(md.len()));
     res.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_str(&meta.content_type)
@@ -1023,12 +1113,24 @@ fn parse_parts_list(body: &[u8]) -> Vec<(u32, String)> {
     parts
 }
 
-/// Text of the first `<tag>…</tag>` element inside `block`.
+/// Text of the first `<tag>…</tag>` element inside `block`, with the five
+/// predefined XML entities resolved (the AWS SDK escapes `"` in text
+/// content, so a part ETag arrives as `&quot;…&quot;`).
 fn xml_text(block: &str, tag: &str) -> Option<String> {
     let open = format!("<{tag}>");
     let start = block.find(open.as_str())? + open.len();
     let len = block[start..].find('<')?;
-    Some(block[start..start + len].to_string())
+    Some(xml_unescape(&block[start..start + len]))
+}
+
+/// Resolve `&lt; &gt; &quot; &apos; &amp;` — `&amp;` last, so an escaped
+/// entity reference survives as text instead of double-decoding.
+fn xml_unescape(text: &str) -> String {
+    text.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
 }
 
 /// Anything else — keep the pinned invariant that errors are XML documents.
