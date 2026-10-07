@@ -27,7 +27,7 @@ use std::{
 
 use axum::{
     body::{Body, Bytes},
-    extract::{Path, State},
+    extract::{Path, RawQuery, State},
     http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::{any, get},
@@ -143,6 +143,7 @@ async fn bucket_endpoint(
     method: Method,
     State(state): State<AppState>,
     Path(bucket): Path<String>,
+    RawQuery(query): RawQuery,
 ) -> Response {
     if method == Method::PUT {
         create_bucket(&state, &bucket)
@@ -151,7 +152,7 @@ async fn bucket_endpoint(
     } else if method == Method::DELETE {
         delete_bucket(&state, &bucket)
     } else if method == Method::GET {
-        get_bucket(&state, &bucket)
+        get_bucket(&state, &bucket, query.as_deref())
     } else {
         method_not_allowed(format!("/{bucket}"))
     }
@@ -214,18 +215,231 @@ fn delete_bucket(state: &AppState, bucket: &str) -> Response {
     }
 }
 
-/// GET /<bucket> — object listing; ListObjectsV2 lands in stage 4.
-fn get_bucket(state: &AppState, bucket: &str) -> Response {
+/// GET /<bucket>?list-type=2 — ListObjectsV2 (stage 4).
+///
+/// Pinned by tests/list_tests.rs: keys sorted lexicographically; envelope
+/// Name/Prefix/KeyCount/MaxKeys/IsTruncated (+ NextContinuationToken only
+/// when truncated); Contents(Key, LastModified, ETag *bare* md5 — the
+/// quoted form is the GET-object header convention from stage 3; Size,
+/// StorageClass); CommonPrefixes(Prefix) rollup under `delimiter`, applied
+/// after `prefix` narrowing; `max-keys` (default 1000) truncates the merged
+/// key/prefix sequence and returns NextContinuationToken = last emitted
+/// key; `continuation-token` resumes strictly after that key. `.meta.json`
+/// sidecars never list as keys.
+fn get_bucket(state: &AppState, bucket: &str, query: Option<&str>) -> Response {
     if !is_valid_bucket_name(bucket) || !bucket_dir(state, bucket).is_dir() {
         return ApiError::no_such_bucket(format!("/{bucket}")).into_response();
     }
-    ApiError::new(
-        StatusCode::NOT_IMPLEMENTED,
-        "NotImplemented",
-        "GET bucket (ListObjects) is implemented in stage 4",
-        format!("/{bucket}"),
-    )
-    .into_response()
+    let p = ListParams::parse(query);
+
+    let mut keys = Vec::new();
+    collect_keys(&bucket_dir(state, bucket), "", &mut keys);
+    keys.sort(); // String Ord = byte-wise lexicographic, as S3 requires
+
+    let keys = keys
+        .into_iter()
+        .filter(|k| k.starts_with(&p.prefix))
+        .filter(|k| p.start_after.as_deref().map_or(true, |s| k.as_str() > s))
+        .filter(|k| p.token.as_deref().map_or(true, |t| k.as_str() > t));
+
+    // Delimiter rollup: every key sharing the first delimiter boundary
+    // after the prefix collapses into one CommonPrefixes entry. Sorted keys
+    // make each group contiguous, so deduping against the previous entry
+    // suffices. The first producing key rides along as the resume anchor.
+    let mut entries: Vec<ListEntry> = Vec::new();
+    for key in keys {
+        let rolled = p.delimiter.as_deref().and_then(|d| {
+            key[p.prefix.len()..]
+                .find(d)
+                .map(|i| key[..p.prefix.len() + i + d.len()].to_string())
+        });
+        match rolled {
+            Some(cp) => {
+                let dup = matches!(entries.last(), Some(ListEntry::Prefix(prev, _)) if prev.as_str() == cp);
+                if !dup {
+                    entries.push(ListEntry::Prefix(cp, key));
+                }
+            }
+            None => entries.push(ListEntry::Key(key)),
+        }
+    }
+
+    let truncated = p.max_keys > 0 && entries.len() > p.max_keys;
+    let page: Vec<ListEntry> = entries.into_iter().take(p.max_keys).collect();
+    let next_token = if truncated {
+        page.last().map(ListEntry::resume_key).map(str::to_string)
+    } else {
+        None
+    };
+
+    // No inter-tag whitespace anywhere: the tests assert exact adjacent
+    // substrings such as <CommonPrefixes><Prefix>photos/</Prefix></CommonPrefixes>.
+    let mut body = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+         <ListBucketResult xmlns=\"{XML_NS}\">\
+         <Name>{}</Name>\
+         <Prefix>{}</Prefix>",
+        xml_escape(bucket),
+        xml_escape(&p.prefix),
+    );
+    if let Some(d) = &p.delimiter {
+        body.push_str(&format!("<Delimiter>{}</Delimiter>", xml_escape(d)));
+    }
+    if let Some(s) = &p.start_after {
+        body.push_str(&format!("<StartAfter>{}</StartAfter>", xml_escape(s)));
+    }
+    body.push_str(&format!(
+        "<KeyCount>{}</KeyCount><MaxKeys>{}</MaxKeys><IsTruncated>{}</IsTruncated>",
+        page.len(),
+        p.max_keys,
+        truncated
+    ));
+    if let Some(t) = &next_token {
+        body.push_str(&format!(
+            "<NextContinuationToken>{}</NextContinuationToken>",
+            xml_escape(t)
+        ));
+    }
+    for entry in &page {
+        match entry {
+            ListEntry::Key(key) => {
+                let path = object_path(state, bucket, key);
+                let etag = read_meta(&meta_path(state, bucket, key))
+                    .map(|m| m.etag)
+                    .unwrap_or_else(|_| md5::md5_hex(&fs::read(&path).unwrap_or_default()));
+                let modified = fs::metadata(&path)
+                    .ok()
+                    .and_then(|md| md.modified().ok())
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| format_epoch(d.as_secs()))
+                    .unwrap_or_else(|| format_epoch(0));
+                let size = fs::metadata(&path).map(|md| md.len()).unwrap_or(0);
+                body.push_str(&format!(
+                    "<Contents><Key>{}</Key><LastModified>{}</LastModified>\
+                     <ETag>{}</ETag><Size>{}</Size>\
+                     <StorageClass>STANDARD</StorageClass></Contents>",
+                    xml_escape(key),
+                    modified,
+                    xml_escape(&etag),
+                    size
+                ));
+            }
+            ListEntry::Prefix(cp, _) => body.push_str(&format!(
+                "<CommonPrefixes><Prefix>{}</Prefix></CommonPrefixes>",
+                xml_escape(cp)
+            )),
+        }
+    }
+    body.push_str("</ListBucketResult>");
+    xml_response(StatusCode::OK, body)
+}
+
+/// One listing entry: an object key, or a delimiter-rolled common prefix
+/// carrying the first key that produced it as the resume anchor.
+enum ListEntry {
+    Key(String),
+    Prefix(String, String),
+}
+
+impl ListEntry {
+    /// The key a continuation token must resume strictly after.
+    fn resume_key(&self) -> &str {
+        match self {
+            ListEntry::Key(key) => key,
+            ListEntry::Prefix(_, anchor) => anchor,
+        }
+    }
+}
+
+/// Parsed ListObjectsV2 query parameters. Hand-parsed: a serde query
+/// extractor would pull in serde_urlencoded for no gain (minimal-deps pin).
+struct ListParams {
+    prefix: String,
+    delimiter: Option<String>,
+    max_keys: usize,
+    start_after: Option<String>,
+    token: Option<String>,
+}
+
+impl ListParams {
+    fn parse(query: Option<&str>) -> Self {
+        let mut p = ListParams {
+            prefix: String::new(),
+            delimiter: None,
+            max_keys: 1000, // S3 default and service cap
+            start_after: None,
+            token: None,
+        };
+        let Some(q) = query else { return p };
+        for pair in q.split('&') {
+            let (name, value) = match pair.split_once('=') {
+                Some((n, v)) => (n, percent_decode(v)),
+                None => (pair, String::new()),
+            };
+            match name {
+                "prefix" => p.prefix = value,
+                "delimiter" => p.delimiter = Some(value).filter(|d| !d.is_empty()),
+                "max-keys" => p.max_keys = value.parse().unwrap_or(1000).min(1000),
+                "start-after" => p.start_after = Some(value),
+                "continuation-token" => p.token = Some(value),
+                _ => {} // list-type and anything else: the v2 shape is always served
+            }
+        }
+        p
+    }
+}
+
+/// Recursively collect object keys under a bucket directory: the relative
+/// path of every data file. Sidecar `<key>.meta.json` files are never keys.
+/// (Accepted ambiguity of the pinned sidecar layout: a PUT of the literal
+/// key `x.meta.json` shares its data path with `x`'s sidecar and is hidden.)
+fn collect_keys(dir: &StdPath, rel: &str, out: &mut Vec<String>) {
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let name = match entry.file_name().into_string() {
+            Ok(n) => n,
+            Err(_) => continue, // non-UTF-8 names cannot be S3 keys here
+        };
+        let child = if rel.is_empty() {
+            name
+        } else {
+            format!("{rel}/{name}")
+        };
+        let path = entry.path();
+        if path.is_dir() {
+            collect_keys(&path, &child, out);
+        } else if !child.ends_with(".meta.json") {
+            out.push(child);
+        }
+    }
+}
+
+/// Percent-decode a query parameter value (%XX pairs). `+` is left alone:
+/// S3 query parameters are not form-encoded.
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let decoded = if bytes[i] == b'%' && i + 2 < bytes.len() {
+            std::str::from_utf8(&bytes[i + 1..i + 3])
+                .ok()
+                .and_then(|hex| u8::from_str_radix(hex, 16).ok())
+        } else {
+            None
+        };
+        match decoded {
+            Some(b) => {
+                out.push(b);
+                i += 3;
+            }
+            None => {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// /<bucket>/<key> — object core (stage 3): PUT/GET/HEAD/DELETE. An unknown
