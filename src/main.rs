@@ -635,7 +635,7 @@ async fn object_endpoint(
             .to_string();
         put_object(&state, &bucket, &key, &body, &content_type)
     } else if method == Method::GET {
-        get_object(&state, &bucket, &key, &format!("/{bucket}/{key}"))
+        get_object(&state, &bucket, &key, &format!("/{bucket}/{key}"), &headers)
     } else if method == Method::HEAD {
         head_object(&state, &bucket, &key, &format!("/{bucket}/{key}"))
     } else if method == Method::DELETE {
@@ -773,7 +773,25 @@ fn copy_object(
 
 /// GET /<bucket>/<key> — GetObject: 200 with the stored bytes plus
 /// Content-Type and the quoted-md5 ETag; 404 NoSuchKey when absent.
-fn get_object(state: &AppState, bucket: &str, key: &str, resource: &str) -> Response {
+///
+/// Stage 9 — conditionals and range, evaluated in HTTP precedence order
+/// (If-Match, then If-None-Match, then Range; the tests pin each alone):
+/// - If-Match mismatching the current etag -> 412 PreconditionFailed.
+/// - If-None-Match matching -> 304 Not Modified with an empty body.
+/// - `Range: bytes=a-b` (inclusive) / `bytes=a-` (open-ended) -> 206 with
+///   `Content-Range: bytes a-b/<total>` and the sliced body; malformed,
+///   multi-, or unsatisfiable ranges -> 416 InvalidRange.
+/// Comparands are the quoted-md5 etags, so quotes are trimmed before
+/// comparing; `*` means "any existing object". The tests sign these
+/// headers, so the stage-2 verifier has already folded them into the
+/// canonical request by the time we get here.
+fn get_object(
+    state: &AppState,
+    bucket: &str,
+    key: &str,
+    resource: &str,
+    headers: &HeaderMap,
+) -> Response {
     let body = match fs::read(object_path(state, bucket, key)) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -785,6 +803,43 @@ fn get_object(state: &AppState, bucket: &str, key: &str, resource: &str) -> Resp
         Ok(meta) => meta,
         Err(err) => return internal_error("could not read object metadata", err),
     };
+
+    if let Some(want) = headers.get("if-match").and_then(|v| v.to_str().ok()) {
+        let want = want.trim_matches('"');
+        if want != "*" && want != meta.etag {
+            return ApiError::precondition_failed(resource).into_response();
+        }
+    }
+    if let Some(want) = headers.get("if-none-match").and_then(|v| v.to_str().ok()) {
+        let want = want.trim_matches('"');
+        if want == "*" || want == meta.etag {
+            let mut res = empty_response(StatusCode::NOT_MODIFIED);
+            res.headers_mut()
+                .insert(header::ETAG, quoted_etag(&meta.etag));
+            return res;
+        }
+    }
+    if let Some(spec) = headers.get("range").and_then(|v| v.to_str().ok()) {
+        let Some((start, end)) = parse_range(spec, body.len()) else {
+            return ApiError::invalid_range(resource).into_response();
+        };
+        let mut res = Response::new(Body::from(body[start..=end].to_vec()));
+        *res.status_mut() = StatusCode::PARTIAL_CONTENT;
+        res.headers_mut().insert(
+            header::CONTENT_RANGE,
+            HeaderValue::from_str(&format!("bytes {start}-{end}/{}", body.len()))
+                .unwrap_or_else(|_| HeaderValue::from_static("bytes */*")),
+        );
+        res.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_str(&meta.content_type)
+                .unwrap_or_else(|_| HeaderValue::from_static(DEFAULT_CONTENT_TYPE)),
+        );
+        res.headers_mut()
+            .insert(header::ETAG, quoted_etag(&meta.etag));
+        return res;
+    }
+
     let mut res = Response::new(Body::from(body));
     res.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -794,6 +849,31 @@ fn get_object(state: &AppState, bucket: &str, key: &str, resource: &str) -> Resp
     res.headers_mut()
         .insert(header::ETAG, quoted_etag(&meta.etag));
     res
+}
+
+/// Parse a single `bytes=a-b` (inclusive both ends) or `bytes=a-`
+/// (open-ended) range against a body of `len` bytes; the end is clamped to
+/// `len - 1`. None — pinned as 416 InvalidRange — for anything malformed:
+/// no `bytes=` prefix, the `bytes=-N` suffix form, multiple ranges, a
+/// non-numeric bound, or a start at/after the end of the object.
+fn parse_range(spec: &str, len: usize) -> Option<(usize, usize)> {
+    if len == 0 {
+        return None;
+    }
+    let rest = spec.trim().strip_prefix("bytes=")?;
+    let (start, end) = rest.split_once('-')?;
+    if start.trim().is_empty() {
+        return None;
+    }
+    let start: usize = start.trim().parse().ok()?;
+    let end = match end.trim() {
+        "" => len - 1,
+        digits => digits.parse::<usize>().ok()?.min(len - 1),
+    };
+    if start >= len || end < start {
+        return None;
+    }
+    Some((start, end))
 }
 
 /// HEAD /<bucket>/<key> — HeadObject: the headers GET would send, no body.
@@ -1200,6 +1280,24 @@ impl ApiError {
             StatusCode::NOT_FOUND,
             "NoSuchKey",
             "The specified key does not exist",
+            resource,
+        )
+    }
+
+    fn precondition_failed(resource: impl Into<String>) -> Self {
+        Self::new(
+            StatusCode::PRECONDITION_FAILED,
+            "PreconditionFailed",
+            "At least one of the pre-conditions you specified did not hold",
+            resource,
+        )
+    }
+
+    fn invalid_range(resource: impl Into<String>) -> Self {
+        Self::new(
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            "InvalidRange",
+            "The requested range cannot be satisfied",
             resource,
         )
     }
