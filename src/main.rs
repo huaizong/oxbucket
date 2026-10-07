@@ -468,6 +468,21 @@ async fn object_endpoint(
     // Explicit dispatch, mirroring bucket_endpoint, so HEAD never falls back
     // to the GET handler.
     if method == Method::PUT {
+        // CopyObject (stage 5): a body-less PUT carrying x-amz-copy-source.
+        // The header is listed in SignedHeaders, so verify() above already
+        // folded it into the signature check.
+        if let Some(source) = headers
+            .get("x-amz-copy-source")
+            .and_then(|value| value.to_str().ok())
+        {
+            return copy_object(
+                &state,
+                &bucket,
+                &key,
+                source,
+                &format!("/{bucket}/{key}"),
+            );
+        }
         let content_type = headers
             .get(header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
@@ -515,6 +530,100 @@ fn put_object(
     res.headers_mut()
         .insert(header::ETAG, quoted_etag(&meta.etag));
     res
+}
+
+/// PUT /<bucket>/<key> with x-amz-copy-source — CopyObject (stage 5).
+///
+/// Pinned by tests/copy_tests.rs: the source spec is `[ / ]<bucket>/<key>`
+/// (URL-encoded, optional leading slash, optional `?versionId` suffix that
+/// is split off before decoding); the bytes AND the `.meta.json` sidecar
+/// (content-type + etag) are copied to the destination, overwriting any
+/// object already there. Answers 200 with CopyObjectResult XML whose ETag
+/// is the *bare* md5 (the ListObjectsV2 convention) plus LastModified. A
+/// missing source (bucket or key) is a 404 NoSuchKey; copying an object
+/// onto itself is an allowed no-op rewrite.
+fn copy_object(
+    state: &AppState,
+    bucket: &str,
+    key: &str,
+    source: &str,
+    resource: &str,
+) -> Response {
+    // A literal '?' in a key always travels percent-encoded, so the first
+    // raw '?' starts the versionId suffix — split it off BEFORE decoding.
+    let source = source.split('?').next().unwrap_or(source);
+    let decoded = percent_decode(source);
+    let decoded = decoded.strip_prefix('/').unwrap_or(decoded.as_str());
+    let Some((src_bucket, src_key)) = decoded.split_once('/') else {
+        return ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "InvalidArgument",
+            "x-amz-copy-source must be <bucket>/<key>",
+            resource.to_string(),
+        )
+        .into_response();
+    };
+    if !is_valid_key(src_key) {
+        return ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "InvalidArgument",
+            "The specified copy source key is not valid",
+            resource.to_string(),
+        )
+        .into_response();
+    }
+
+    let src = object_path(state, src_bucket, src_key);
+    let dst = object_path(state, bucket, key);
+    // Copying onto itself would read and truncate the same file, so it is
+    // an allowed no-op: keep the existing bytes and sidecar.
+    if src != dst {
+        // Missing source bucket or key -> 404 NoSuchKey, as pinned.
+        if let Err(err) = fs::metadata(&src) {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                return ApiError::no_such_key(resource).into_response();
+            }
+            return internal_error("could not stat copy source", err);
+        }
+        if let Some(parent) = dst.parent() {
+            if let Err(err) = fs::create_dir_all(parent) {
+                return internal_error("could not create object directory", err);
+            }
+        }
+        if let Err(err) = fs::copy(&src, &dst) {
+            return internal_error("could not copy object bytes", err);
+        }
+        // Equal bytes carry the same etag; the sidecar is copied wholesale
+        // so content-type and etag travel with them.
+        if let Err(err) =
+            fs::copy(meta_path(state, src_bucket, src_key), meta_path(state, bucket, key))
+        {
+            return internal_error("could not copy object metadata", err);
+        }
+    }
+
+    let body = fs::read(&dst).unwrap_or_default();
+    let etag = read_meta(&meta_path(state, bucket, key))
+        .map(|meta| meta.etag)
+        .unwrap_or_else(|_| md5::md5_hex(&body));
+    let modified = fs::metadata(&dst)
+        .ok()
+        .and_then(|md| md.modified().ok())
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| format_epoch(d.as_secs()))
+        .unwrap_or_else(|| format_epoch(0));
+    xml_response(
+        StatusCode::OK,
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <CopyObjectResult xmlns=\"{XML_NS}\">\
+             <ETag>{}</ETag>\
+             <LastModified>{}</LastModified>\
+             </CopyObjectResult>",
+            xml_escape(&etag),
+            modified
+        ),
+    )
 }
 
 /// GET /<bucket>/<key> — GetObject: 200 with the stored bytes plus
