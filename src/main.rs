@@ -80,6 +80,16 @@ async fn main() {
     let app = Router::new()
         .route("/", get(list_buckets))
         .route("/{bucket}", any(bucket_endpoint))
+        // aws-sdk-s3 sends bucket-level calls (CreateBucket / ListObjects /
+        // DeleteBucket / HeadBucket) as `PUT/GET/HEAD/DELETE /<bucket>/`
+        // with a trailing slash on the wire. In axum 0.8 `/{bucket}` is a
+        // single-segment capture and does NOT match `/{bucket}/`, so without
+        // this explicit sibling route those requests 404 before the
+        // `normalize_bucket_root` middleware can rewrite the URI. Adding
+        // `/{bucket}/` as a distinct pattern (axum treats both as separate
+        // match arms) lets both wire shapes route straight to the same
+        // handler; `Path<String>` yields the bucket name either way.
+        .route("/{bucket}/", any(bucket_endpoint))
         .route("/{bucket}/{*key}", any(object_endpoint))
         .fallback(unknown_resource)
         // Stage 7: the aws-sdk-s3 sends `PUT /<bucket>/` (trailing slash)
@@ -87,9 +97,14 @@ async fn main() {
         // In axum the LAST-added layer is outermost and sees the request
         // first, so `authorize` is added last: it must verify against the
         // ORIGINAL wire path to match the client's canonical request.
-        // `normalize_bucket_root` (inner) then strips the bucket-root
-        // slash before routing. Object paths '/b/k/' pass through
-        // untouched (the slash is part of the key).
+        // Note: Router::layer wraps the *matched endpoint* — routing is
+        // resolved BEFORE the inner middleware runs, so
+        // `normalize_bucket_root`'s URI rewrite never influenced route
+        // selection (that was the stage-7 404). With the explicit
+        // `/{bucket}/` route above it is a harmless no-op (no handler
+        // re-reads the URI it rewrites); kept as a safety net. Object
+        // paths '/b/k/' pass through untouched (the slash is part of the
+        // key).
         .layer(axum::middleware::from_fn(normalize_bucket_root))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
