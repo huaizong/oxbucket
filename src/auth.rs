@@ -21,10 +21,14 @@
 //! signature := hex(HMAC(signing key, string-to-sign))
 //!
 //! `UNSIGNED-PAYLOAD` (and the streaming marker) pass through verbatim as
-//! the payload-hash line — exactly what the client signed. Known
-//! simplifications, both invisible to the pinned suites: header values are
-//! trimmed but their inner whitespace is not collapsed, and the canonical
-//! query is the raw query string rather than a sorted re-encoding.
+//! the payload-hash line — exactly what the client signed. The canonical
+//! query is canonicalized per SigV4: split the raw query on '&', drop empty
+//! segments, percent-decode each key and value, sort the pairs, re-encode
+//! both sides with the AWS URI rules (unreserved A-Za-z0-9-_.~ pass
+//! through, every other byte becomes %XX uppercase) and join `k=v` with
+//! '&' — mirroring the spec-correct signer in `tests/common/mod.rs`.
+//! Remaining simplification, invisible to the pinned suites: header values
+//! are trimmed but their inner whitespace is not collapsed.
 
 use axum::{
     extract::{Request, State},
@@ -33,7 +37,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-use crate::{ApiError, AppState};
+use crate::{percent_decode, ApiError, AppState};
 
 /// Server-side credential pair plus the enforcement switch.
 #[derive(Clone)]
@@ -108,6 +112,50 @@ impl AuthError {
             .into_response(),
         }
     }
+}
+
+/// AWS SigV4 URI encoding: everything unreserved (`A-Za-z0-9-_.~`) passes
+/// through; every other byte becomes `%XX` with uppercase hex. Byte-wise
+/// mirror of `aws_uri_encode` in `tests/common/mod.rs`.
+fn uri_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Canonical query string per SigV4: split the raw query on `&`, drop empty
+/// segments, percent-decode each key and value (`+` is left alone — S3 query
+/// parameters are not form-encoded), sort the decoded pairs, then re-encode
+/// both sides with the AWS URI rules and join `k=v` with `&`. Clients sign
+/// this sorted re-encoding, not the raw wire order, and real SDKs deliver
+/// the wire already percent-encoded, so decoding first normalizes both raw
+/// (`delimiter=/`) and encoded (`delimiter=%2F`) traffic onto one form.
+fn canonical_query(raw: Option<&str>) -> String {
+    let Some(raw) = raw else { return String::new() };
+    if raw.is_empty() {
+        return String::new();
+    }
+    let mut pairs: Vec<(String, String)> = raw
+        .split('&')
+        .filter(|kv| !kv.is_empty())
+        .map(|kv| match kv.split_once('=') {
+            Some((k, v)) => (percent_decode(k), percent_decode(v)),
+            None => (percent_decode(kv), String::new()),
+        })
+        .collect();
+    pairs.sort();
+    pairs
+        .iter()
+        .map(|(k, v)| format!("{}={}", uri_encode(k), uri_encode(v)))
+        .collect::<Vec<_>>()
+        .join("&")
 }
 
 /// Verify the SigV4 Authorization header of one request.
@@ -229,7 +277,7 @@ fn verify(
     let canonical_request = format!(
         "{method}\n{path}\n{query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}",
         path = uri.path(),
-        query = uri.query().unwrap_or(""),
+        query = canonical_query(uri.query()),
     );
 
     let scope = format!("{date}/{region}/{service}/aws4_request");
