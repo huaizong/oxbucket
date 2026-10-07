@@ -29,6 +29,16 @@
 //! '&' — mirroring the spec-correct signer in `tests/common/mod.rs`.
 //! Remaining simplification, invisible to the pinned suites: header values
 //! are trimmed but their inner whitespace is not collapsed.
+//!
+//! Stage 10 adds the query-string flavor (presigned URLs): a request with
+//! no Authorization header but an `X-Amz-Signature` query parameter is
+//! verified by [`verify_query_auth`]. The canonical request is rebuilt from
+//! the raw query segments minus `X-Amz-Signature` (kept exactly as they
+//! arrived — the client signed the same encoded text), sorted byte-wise,
+//! the payload-hash line is fixed `UNSIGNED-PAYLOAD`, and date, region and
+//! service come from `X-Amz-Credential` (any region signs, none is pinned
+//! server-side). The URL is dead once `X-Amz-Date + X-Amz-Expires` lies in
+//! the past — 403 `AccessDenied` with an "expired" message.
 
 use axum::{
     extract::{Request, State},
@@ -74,6 +84,23 @@ pub(crate) async fn authorize(
 ) -> Response {
     if !state.auth.enforced {
         return next.run(req).await;
+    }
+    // Stage 10: presigned URLs carry their signature in the query string and
+    // no Authorization header at all. The `X-Amz-Signature=` peek keeps
+    // ordinary unsigned requests on the header path's "header is missing"
+    // error instead of a presigned-specific one.
+    if req.headers().get(header::AUTHORIZATION).is_none()
+        && req
+            .uri()
+            .query()
+            .is_some_and(|q| q.contains("X-Amz-Signature="))
+    {
+        let verdict =
+            verify_query_auth(req.method().as_str(), req.uri(), req.headers(), &state.auth);
+        return match verdict {
+            Ok(()) => next.run(req).await,
+            Err(err) => err.into_response(req.uri().path()),
+        };
     }
     let verdict = verify(req.method().as_str(), req.uri(), req.headers(), &state.auth);
     match verdict {
@@ -278,6 +305,228 @@ fn verify(
         "{method}\n{path}\n{query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}",
         path = uri.path(),
         query = canonical_query(uri.query()),
+    );
+
+    let scope = format!("{date}/{region}/{service}/aws4_request");
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
+        hex(&sha256(canonical_request.as_bytes()))
+    );
+
+    let k_date = hmac_sha256(format!("AWS4{}", creds.secret_key).as_bytes(), date.as_bytes());
+    let k_region = hmac_sha256(&k_date, region.as_bytes());
+    let k_service = hmac_sha256(&k_region, b"s3");
+    let k_signing = hmac_sha256(&k_service, b"aws4_request");
+    let expected = hex(&hmac_sha256(&k_signing, string_to_sign.as_bytes()));
+
+    if constant_time_eq(&expected, &signature) {
+        Ok(())
+    } else {
+        Err(AuthError::SignatureDoesNotMatch)
+    }
+}
+
+/// Seconds since the Unix epoch.
+fn epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Parse `yyyymmddThhmmssZ` (the `X-Amz-Date` shape) into seconds since the
+/// Unix epoch. The inverse of `format_epoch` in main.rs — same civil-date
+/// arithmetic (Hinnant's days_from_civil), run backwards. `None` on any
+/// shape or calendar violation (month 0/13, hour 24, ...).
+fn amz_date_to_epoch(s: &str) -> Option<u64> {
+    let b = s.as_bytes();
+    if b.len() != 16 || b[8] != b'T' || b[15] != b'Z' {
+        return None;
+    }
+    // Digits-only slice parse, so `slice.parse` cannot accept `+12` or ` 12`.
+    let num = |range: std::ops::Range<usize>| -> Option<u64> {
+        let slice = s.get(range)?;
+        if !slice.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        slice.parse::<u64>().ok()
+    };
+    let (year, month, day) = (num(0..4)?, num(4..6)?, num(6..8)?);
+    let (hh, mm, ss) = (num(9..11)?, num(11..13)?, num(13..15)?);
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hh > 23
+        || mm > 59
+        || ss > 60
+    {
+        return None;
+    }
+    let y = year as i64 - if month <= 2 { 1 } else { 0 };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let mp = if month > 2 { month - 3 } else { month + 9 } as i64; // [0, 11]
+    let doy = (153 * mp + 2) / 5 + day as i64 - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    let days = era * 146_097 + doe - 719_468;
+    Some((days * 86_400 + (hh * 3_600 + mm * 60 + ss) as i64) as u64)
+}
+
+/// Canonical query string for presigned URLs: the raw query segments as they
+/// arrived on the wire (split on `&`), minus `X-Amz-Signature`, sorted
+/// byte-wise and rejoined. Unlike [`canonical_query`] this deliberately does
+/// NOT percent-decode/re-encode: a presigning client signs the exact encoded
+/// text it puts in the URL, so matching the raw bytes is the faithful
+/// reconstruction of what was signed (and cannot disagree about encoding
+/// rules).
+fn canonical_query_raw(raw: &str) -> String {
+    let mut segments: Vec<&str> = raw
+        .split('&')
+        .filter(|kv| !kv.is_empty() && kv != "X-Amz-Signature")
+        .filter(|kv| !kv.starts_with("X-Amz-Signature="))
+        .collect();
+    segments.sort_unstable();
+    segments.join("&")
+}
+
+/// Verify a presigned (query-string SigV4) request: the URL carries
+/// `X-Amz-Algorithm`, `X-Amz-Credential`, `X-Amz-Date`, `X-Amz-Expires`,
+/// `X-Amz-SignedHeaders` and `X-Amz-Signature` instead of an Authorization
+/// header.
+///
+/// The canonical request mirrors [`verify`] with three presign-specific
+/// differences: the query is the raw-sorted form from [`canonical_query_raw`],
+/// the payload-hash line is fixed `UNSIGNED-PAYLOAD` (a URL cannot carry a
+/// body hash header the signer never saw a body for), and the date, region
+/// and service come from the `X-Amz-Credential` scope (any region signs —
+/// this server pins no region; the credential date must match `X-Amz-Date`).
+/// The URL is dead once `X-Amz-Date + X-Amz-Expires` lies in the past.
+fn verify_query_auth(
+    method: &str,
+    uri: &Uri,
+    headers: &HeaderMap,
+    creds: &Credentials,
+) -> Result<(), AuthError> {
+    let raw_query = uri.query().unwrap_or_default();
+
+    let mut algorithm = None;
+    let mut credential = None;
+    let mut amz_date = None;
+    let mut expires = None;
+    let mut signed_headers = None;
+    let mut signature = None;
+    for kv in raw_query.split('&') {
+        let (key, value) = match kv.split_once('=') {
+            Some((k, v)) => (k, v),
+            None => (kv, ""),
+        };
+        // Hex case is insignificant, mirroring the header path's Signature.
+        let value = if key == "X-Amz-Signature" {
+            value.to_ascii_lowercase()
+        } else {
+            value.to_string()
+        };
+        match key {
+            "X-Amz-Algorithm" => algorithm = Some(value),
+            "X-Amz-Credential" => credential = Some(value),
+            "X-Amz-Date" => amz_date = Some(value),
+            "X-Amz-Expires" => expires = Some(value),
+            "X-Amz-SignedHeaders" => signed_headers = Some(value),
+            "X-Amz-Signature" => signature = Some(value),
+            _ => {} // ordinary request parameters are canonicalized instead
+        }
+    }
+    if algorithm.as_deref() != Some("AWS4-HMAC-SHA256") {
+        return Err(AuthError::AccessDenied(
+            "Unsupported X-Amz-Algorithm; expected AWS4-HMAC-SHA256",
+        ));
+    }
+    let credential = credential.ok_or(AuthError::AccessDenied(
+        "The X-Amz-Credential query parameter is missing",
+    ))?;
+    let amz_date = amz_date.ok_or(AuthError::AccessDenied(
+        "The X-Amz-Date query parameter is missing",
+    ))?;
+    let expires = expires.ok_or(AuthError::AccessDenied(
+        "The X-Amz-Expires query parameter is missing",
+    ))?;
+    let signed_headers = signed_headers.ok_or(AuthError::AccessDenied(
+        "The X-Amz-SignedHeaders query parameter is missing",
+    ))?;
+    let signature = signature.ok_or(AuthError::AccessDenied(
+        "The X-Amz-Signature query parameter is missing",
+    ))?;
+
+    // Credential = <access-key>/<yyyymmdd>/<region>/<service>/aws4_request
+    let mut scope = credential.split('/');
+    let access_key = scope.next().unwrap_or_default();
+    let date = scope.next().unwrap_or_default();
+    let region = scope.next().unwrap_or_default();
+    let service = scope.next().unwrap_or_default();
+    let terminator = scope.next().unwrap_or_default();
+    if scope.next().is_some()
+        || access_key.is_empty()
+        || date.len() != 8
+        || region.is_empty()
+        || service != "s3"
+        || terminator != "aws4_request"
+    {
+        return Err(AuthError::AccessDenied(
+            "Malformed X-Amz-Credential; expected <key>/<yyyymmdd>/<region>/s3/aws4_request",
+        ));
+    }
+    if access_key != creds.access_key {
+        return Err(AuthError::AccessDenied(
+            "The access key does not match the configured credential",
+        ));
+    }
+
+    // Same shape as the header path's x-amz-date: yyyymmddThhmmssZ, and the
+    // Credential scope date must match its yyyymmdd prefix.
+    if amz_date.len() != 16 {
+        return Err(AuthError::AccessDenied(
+            "Malformed X-Amz-Date; expected yyyymmddThhmmssZ",
+        ));
+    }
+    if amz_date.as_bytes()[..8] != *date.as_bytes() {
+        return Err(AuthError::AccessDenied(
+            "The Credential scope date does not match X-Amz-Date",
+        ));
+    }
+    let issued_at = amz_date_to_epoch(amz_date).ok_or(AuthError::AccessDenied(
+        "Malformed X-Amz-Date; expected yyyymmddThhmmssZ",
+    ))?;
+    let expires_secs: u64 = expires.parse().map_err(|_| {
+        AuthError::AccessDenied("Malformed X-Amz-Expires; expected a whole number of seconds")
+    })?;
+    if epoch_secs() > issued_at.saturating_add(expires_secs) {
+        return Err(AuthError::AccessDenied(
+            "Request has expired; the presigned URL's X-Amz-Date plus X-Amz-Expires is in the past",
+        ));
+    }
+
+    // Canonical headers: one `<lowercase-name>:<trimmed-value>\n` line per
+    // entry of X-Amz-SignedHeaders, in the client's (required-sorted) order.
+    let mut canonical_headers = String::new();
+    for name in signed_headers.split(';') {
+        let name = name.trim().to_ascii_lowercase();
+        let value = headers
+            .get(name.as_str())
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .ok_or(AuthError::AccessDenied(
+                "A header listed in X-Amz-SignedHeaders is missing from the request",
+            ))?;
+        canonical_headers.push_str(&name);
+        canonical_headers.push(':');
+        canonical_headers.push_str(value);
+        canonical_headers.push('\n');
+    }
+
+    // Presigned URLs never sign a body: fixed UNSIGNED-PAYLOAD.
+    let canonical_request = format!(
+        "{method}\n{path}\n{query}\n{canonical_headers}\n{signed_headers}\nUNSIGNED-PAYLOAD",
+        path = uri.path(),
+        query = canonical_query_raw(raw_query),
     );
 
     let scope = format!("{date}/{region}/{service}/aws4_request");
