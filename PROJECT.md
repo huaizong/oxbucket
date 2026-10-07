@@ -18,13 +18,13 @@ Architecture decisions (pinned by owner):
   aws-sdk-s3 conformance suite behind a feature flag)
 
 Stage plan (tests arrive per stage, specs in test docstrings):
-1. bucket CRUD  — PUT/GET/DELETE bucket, GET / (ListBuckets), XML shapes
-2. SigV4        — real signer; reject bad signature with 403
-3. object core  — PUT/GET/HEAD/DELETE object, etag, content-type
-4. ListObjectsV2 — keys, prefix, delimiter (common prefixes), max-keys
-5. CopyObject   — + conditional If-None-Match/* / metadata replace
-6. Multipart    — create/upload-part/complete/abort + assembled GET
-7. conformance  — aws-sdk-s3 suite (feature-gated), compat fixes
+1. bucket CRUD  — PUT/GET/DELETE bucket, GET / (ListBuckets), XML shapes — done
+2. SigV4        — real signer; reject bad signature with 403 — done
+3. object core  — PUT/GET/HEAD/DELETE object, etag, content-type — done
+4. ListObjectsV2 — keys, prefix, delimiter (common prefixes), max-keys — done
+5. CopyObject   — + conditional If-None-Match/* / metadata replace — done
+6. Multipart    — create/upload-part/complete/abort + assembled GET — done
+7. conformance  — aws-sdk-s3 suite (feature-gated), compat fixes — done
 
 Ground rules: never modify tests; each stage ends green in the human's
 external cargo run; no shell on this platform (verify by trace); commit
