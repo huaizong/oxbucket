@@ -40,7 +40,13 @@ fn presign_get(port: u16, bucket: &str, key: &str, tamper: bool, expired: bool) 
     let q = format!(
         "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential={cred}&X-Amz-Date={amz_date}&X-Amz-Expires=300&X-Amz-SignedHeaders=host"
     );
-    let canonical_req = format!("GET\n/{bucket}/{key}\n{q}\nhost:{host}\nhost\nUNSIGNED-PAYLOAD");
+    let canonical_req = format!("GET
+/{bucket}/{key}
+{q}
+host:{host}
+
+host
+UNSIGNED-PAYLOAD");
     let scope = format!("{date}/cn-north-1/s3/aws4_request");
     let string_to_sign = format!("AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}", sha256_hex(canonical_req.as_bytes()));
     let k = hmac(format!("AWS4testsecret").as_bytes(), date.as_bytes());
