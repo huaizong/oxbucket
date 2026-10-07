@@ -223,7 +223,7 @@ async fn bucket_endpoint(
     State(state): State<AppState>,
     Path(bucket): Path<String>,
     RawQuery(query): RawQuery,
-    _body: Bytes,
+    body: Bytes,
 ) -> Response {
     if method == Method::PUT {
         create_bucket(&state, &bucket)
@@ -233,6 +233,8 @@ async fn bucket_endpoint(
         delete_bucket(&state, &bucket)
     } else if method == Method::GET {
         get_bucket(&state, &bucket, query.as_deref())
+    } else if method == Method::POST && is_delete_query(query.as_deref()) {
+        delete_objects(&state, &bucket, &body, &format!("/{bucket}"))
     } else {
         method_not_allowed(format!("/{bucket}"))
     }
@@ -633,7 +635,8 @@ async fn object_endpoint(
             .and_then(|value| value.to_str().ok())
             .unwrap_or(DEFAULT_CONTENT_TYPE)
             .to_string();
-        put_object(&state, &bucket, &key, &body, &content_type)
+        let user_metadata = collect_user_metadata(&headers);
+        put_object(&state, &bucket, &key, &body, &content_type, &user_metadata)
     } else if method == Method::GET {
         get_object(&state, &bucket, &key, &format!("/{bucket}/{key}"), &headers)
     } else if method == Method::HEAD {
@@ -653,6 +656,7 @@ fn put_object(
     key: &str,
     body: &[u8],
     content_type: &str,
+    user_metadata: &[(String, String)],
 ) -> Response {
     let path = object_path(state, bucket, key);
     // Nested keys ("a/b") live in sub-directories; create them on demand.
@@ -667,6 +671,10 @@ fn put_object(
     let meta = ObjectMeta {
         etag: md5::md5_hex(body),
         content_type: content_type.to_string(),
+        user_metadata: user_metadata
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
     };
     if let Err(err) = write_meta(&meta_path(state, bucket, key), &meta) {
         return internal_error("could not write object metadata", err);
@@ -837,6 +845,7 @@ fn get_object(
         );
         res.headers_mut()
             .insert(header::ETAG, quoted_etag(&meta.etag));
+        apply_user_metadata(res.headers_mut(), &meta.user_metadata);
         return res;
     }
 
@@ -848,6 +857,7 @@ fn get_object(
     );
     res.headers_mut()
         .insert(header::ETAG, quoted_etag(&meta.etag));
+    apply_user_metadata(res.headers_mut(), &meta.user_metadata);
     res
 }
 
@@ -902,6 +912,7 @@ fn head_object(state: &AppState, bucket: &str, key: &str, resource: &str) -> Res
     );
     res.headers_mut()
         .insert(header::ETAG, quoted_etag(&meta.etag));
+    apply_user_metadata(res.headers_mut(), &meta.user_metadata);
     res
 }
 
@@ -928,6 +939,93 @@ fn delete_object(state: &AppState, bucket: &str, key: &str) -> Response {
         }
     }
     empty_response(StatusCode::NO_CONTENT)
+}
+
+/// True when the query string carries the value-less `delete` marker
+/// (stage 11 DeleteObjects). Mirrors [`MultipartQuery::parse`]: pairs
+/// split on `&`, names matched raw, so `?delete` and `?delete=` both
+/// qualify.
+fn is_delete_query(query: Option<&str>) -> bool {
+    let Some(query) = query else { return false };
+    query.split('&').any(|pair| {
+        let (name, _) = pair.split_once('=').unwrap_or((pair, ""));
+        name == "delete"
+    })
+}
+
+/// POST /<bucket>?delete — DeleteObjects (stage 11).
+///
+/// Deletes every listed key (bytes + `.meta.json` sidecar) and reports
+/// `<Deleted>` for each requested key — including keys that never
+/// existed (S3 idempotency). Bytes for ALL keys are removed before any
+/// nested-directory pruning, so one key's prune cannot strand a later
+/// sibling under the same prefix.
+///
+/// Pinned by tests/metadata_tests.rs::multi_delete_batch: the response
+/// is `<DeleteResult …><Deleted><Key>k</Key></Deleted>…</DeleteResult>`;
+/// unlisted keys survive.
+fn delete_objects(state: &AppState, bucket: &str, body: &[u8], resource: &str) -> Response {
+    let keys = parse_delete_keys(body);
+    if keys.is_empty() {
+        return ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "MalformedXML",
+            "The XML you provided was not well-formed or did not validate \
+             against our published schema",
+            resource.to_string(),
+        )
+        .into_response();
+    }
+
+    let mut pruned: Vec<PathBuf> = Vec::new();
+    for key in &keys {
+        let path = object_path(state, bucket, key);
+        if let Err(err) = fs::remove_file(&path) {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                return internal_error("could not delete object", err);
+            }
+        }
+        if let Err(err) = fs::remove_file(meta_path(state, bucket, key)) {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                return internal_error("could not delete object metadata", err);
+            }
+        }
+        if let Some(parent) = path.parent() {
+            if parent != bucket_dir(state, bucket).as_path() {
+                pruned.push(parent.to_path_buf());
+            }
+        }
+    }
+    for parent in &pruned {
+        let _ = fs::remove_dir(parent);
+    }
+
+    let mut xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<DeleteResult xmlns=\"{XML_NS}\">"
+    );
+    for key in &keys {
+        xml.push_str(&format!("<Deleted><Key>{}</Key></Deleted>", xml_escape(key)));
+    }
+    xml.push_str("</DeleteResult>");
+    xml_response(StatusCode::OK, xml)
+}
+
+/// Every `<Key>…</Key>` inside the `<Delete>` request's `<Object>`
+/// blocks, in document order with XML entities resolved — the same
+/// scan as [`parse_parts_list`]. Empty when no `<Object>` block parses.
+fn parse_delete_keys(body: &[u8]) -> Vec<String> {
+    let text = String::from_utf8_lossy(body).into_owned();
+    let mut keys = Vec::new();
+    let mut rest: &str = &text;
+    while let Some(start) = rest.find("<Object>") {
+        let after = &rest[start + "<Object>".len()..];
+        let Some(end) = after.find("</Object>") else { break };
+        if let Some(key) = xml_text(&after[..end], "Key") {
+            keys.push(key);
+        }
+        rest = &after[end + "</Object>".len()..];
+    }
+    keys
 }
 
 // ---------------------------------------------------------------------------
@@ -1148,6 +1246,7 @@ fn complete_multipart(
     let meta = ObjectMeta {
         etag: final_etag.clone(),
         content_type: DEFAULT_CONTENT_TYPE.to_string(),
+        user_metadata: Vec::new(),
     };
     if let Err(err) = write_meta(&meta_path(state, bucket, key), &meta) {
         return internal_error("could not write object metadata", err);
@@ -1347,6 +1446,35 @@ fn method_not_allowed(resource: String) -> Response {
 // Response helpers
 // ---------------------------------------------------------------------------
 
+/// Pull every `x-amz-meta-<name>` header off a PUT request into
+/// (name-without-prefix, value) pairs, preserving header order so that
+/// pair order in the sidecar matches wire order. Values are trimmed of
+/// surrounding whitespace (S3 semantics).
+fn collect_user_metadata(headers: &HeaderMap) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (name, value) in headers.iter() {
+        if let Some(suffix) = name.as_str().strip_prefix("x-amz-meta-") {
+            if let Ok(value) = value.to_str() {
+                out.push((suffix.to_string(), value.trim().to_string()));
+            }
+        }
+    }
+    out
+}
+
+/// Stamp every `x-amz-meta-<name>` back onto a response so the SDK and
+/// awscli round-trip the metadata after PUT.
+fn apply_user_metadata(headers: &mut HeaderMap, metadata: &[(String, String)]) {
+    for (name, value) in metadata {
+        if let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(&format!("x-amz-meta-{name}").as_bytes()),
+            HeaderValue::from_str(value),
+        ) {
+            headers.insert(name, value);
+        }
+    }
+}
+
 fn xml_response(status: StatusCode, body: String) -> Response {
     let mut res = Response::new(Body::from(body));
     *res.status_mut() = status;
@@ -1408,22 +1536,106 @@ const DEFAULT_CONTENT_TYPE: &str = "binary/octet-stream";
 struct ObjectMeta {
     etag: String,
     content_type: String,
+    /// `x-amz-meta-*` user metadata as (name, value) pairs — name without
+    /// the prefix, arrival order preserved. Written by [`put_object`],
+    /// echoed by GetObject/HeadObject; empty when the PUT carried none.
+    user_metadata: Vec<(String, String)>,
 }
 
 impl ObjectMeta {
     fn to_json(&self) -> String {
-        format!(
-            "{{\"etag\":\"{}\",\"content_type\":\"{}\"}}",
+        let mut json = format!(
+            "{{\"etag\":\"{}\",\"content_type\":\"{}\"",
             json_escape(&self.etag),
             json_escape(&self.content_type)
-        )
+        );
+        if !self.user_metadata.is_empty() {
+            json.push_str(",\"user_metadata\":{");
+            for (i, (key, value)) in self.user_metadata.iter().enumerate() {
+                if i > 0 {
+                    json.push(',');
+                }
+                json.push_str(&format!(
+                    "\"{}\":\"{}\"",
+                    json_escape(key),
+                    json_escape(value)
+                ));
+            }
+            json.push('}');
+        }
+        json.push('}');
+        json
     }
 
     fn from_json(text: &str) -> Option<Self> {
         Some(Self {
             etag: json_string_field(text, "etag")?,
             content_type: json_string_field(text, "content_type")?,
+            // Sidecars written before stage 11 carry no user_metadata
+            // object; absence reads as "none".
+            user_metadata: json_object_fields(text, "user_metadata")
+                .unwrap_or_default(),
         })
+    }
+}
+
+/// Decode the JSON string literal starting at `bytes[start] == b'"'`;
+/// returns (decoded value, index just past the closing quote). Handles the
+/// same escape set as [`json_string_field`] (`\"`, `\\`, `\n`); any other
+/// escape — and an unterminated literal — is None.
+fn scan_json_string(bytes: &[u8], start: usize) -> Option<(String, usize)> {
+    let mut out: Vec<u8> = Vec::new();
+    let mut i = start + 1; // skip the opening quote
+    loop {
+        let byte = *bytes.get(i)?;
+        match byte {
+            b'"' => return String::from_utf8(out).ok().map(|s| (s, i + 1)),
+            b'\\' => {
+                i += 1;
+                match *bytes.get(i)? {
+                    b'"' => out.push(b'"'),
+                    b'\\' => out.push(b'\\'),
+                    b'n' => out.push(b'\n'),
+                    _ => return None,
+                }
+            }
+            byte => out.push(byte),
+        }
+        i += 1;
+    }
+}
+
+/// Read the `"field":{"k":"v", …}` object written by [`ObjectMeta::to_json`]
+/// back into (key, value) pairs, honoring the same escapes as
+/// [`json_string_field`]. None — which callers read as "no user metadata" —
+/// when the field is absent or malformed.
+fn json_object_fields(text: &str, field: &str) -> Option<Vec<(String, String)>> {
+    let marker = format!("\"{field}\":{{");
+    let mut i = text.find(&marker)? + marker.len();
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    loop {
+        match bytes.get(i) {
+            // Object closed — all pairs read.
+            Some(b'}') => return Some(out),
+            // Pair separator — skip and keep reading.
+            Some(b',') => i += 1,
+            Some(b'"') => {
+                let (key, next) = scan_json_string(bytes, i)?;
+                i = next;
+                if bytes.get(i) != Some(&b':') {
+                    return None;
+                }
+                i += 1;
+                if bytes.get(i) != Some(&b'"') {
+                    return None;
+                }
+                let (value, next) = scan_json_string(bytes, i)?;
+                i = next;
+                out.push((key, value));
+            }
+            _ => return None,
+        }
     }
 }
 
