@@ -175,3 +175,78 @@ fn aws_uri_encode(s: &str) -> String {
     }
     out
 }
+
+/// Sign a request with EXTRA signed headers (e.g. x-amz-copy-source for
+/// CopyObject). The builder comes pre-seeded with method/url only.
+#[allow(dead_code)]
+pub fn sign_with_extra(
+    port: u16,
+    method: &str,
+    path: &str,
+    body: Option<&[u8]>,
+    extra_headers: &[(&str, &str)],
+    mut builder: reqwest::blocking::RequestBuilder,
+) -> reqwest::blocking::Response {
+    let now = chrono::Utc::now();
+    let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
+    let date = amz_date[..8].to_string();
+    let host = format!("127.0.0.1:{port}");
+    let payload_hash = "UNSIGNED-PAYLOAD";
+    let mut header_lines: Vec<String> = vec![format!("host:{host}")];
+    for (k, v) in extra_headers {
+        header_lines.push(format!("{k}:{v}"));
+        builder = builder.header(*k, *v);
+    }
+    header_lines.push(format!("x-amz-content-sha256:{payload_hash}"));
+    header_lines.push(format!("x-amz-date:{amz_date}"));
+    header_lines.sort();
+    let canonical_headers = header_lines.join("
+") + "
+";
+    let mut signed_list: Vec<String> = header_lines.iter().map(|h| h.split(':').next().unwrap().to_string()).collect();
+    signed_list.sort();
+    signed_list.dedup();
+    let signed_headers = signed_list.join(";");
+    let body_str = body.map(|b| String::from_utf8_lossy(b).to_string()).unwrap_or_default();
+    let (raw_path, raw_query) = match path.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (path, None),
+    };
+    let canonical_query = raw_query
+        .map(|q| {
+            let mut pairs: Vec<(String, String)> = q.split('&').filter(|kv| !kv.is_empty()).map(|kv| {
+                match kv.split_once('=') {
+                    Some((k, v)) => (k.to_string(), v.to_string()),
+                    None => (kv.to_string(), String::new()),
+                }
+            }).collect();
+            pairs.sort();
+            pairs.iter().map(|(k, v)| format!("{}={}", aws_uri_encode(k), aws_uri_encode(v))).collect::<Vec<_>>().join("&")
+        })
+        .unwrap_or_default();
+    let canonical_req = format!(
+        "{method}
+{raw_path}
+{canonical_query}
+{canonical_headers}
+{signed_headers}
+{payload_hash}");
+    let scope = format!("{date}/cn-north-1/s3/aws4_request");
+    let string_to_sign = format!("AWS4-HMAC-SHA256
+{amz_date}
+{scope}
+{}", sha256_hex(canonical_req.as_bytes()));
+    let k = hmac(format!("AWS4testsecret").as_bytes(), date.as_bytes());
+    let k = hmac(&k, b"cn-north-1");
+    let k = hmac(&k, b"s3");
+    let k = hmac(&k, b"aws4_request");
+    let sig = hex(&hmac(&k, string_to_sign.as_bytes()));
+    let auth = format!("AWS4-HMAC-SHA256 Credential=test/{scope}, SignedHeaders={signed_headers}, Signature={sig}");
+    builder
+        .header("x-amz-date", &amz_date)
+        .header("x-amz-content-sha256", payload_hash)
+        .header("Authorization", auth)
+        .body(body_str)
+        .send()
+        .unwrap()
+}
