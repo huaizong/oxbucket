@@ -15,6 +15,10 @@ tokio = { version = "=1.53.1", features = ["macros", "rt-multi-thread", "net"] }
 serde = { version = "=1.0.228", features = ["derive"] }
 
 [dev-dependencies]
+sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
+chrono = "0.4"
 # Integration tests drive the server over raw HTTP. TLS is off: everything
 # in the suites talks plain http://127.0.0.1.
 reqwest = { version = "=0.12.28", default-features = false, features = ["blocking"] }
