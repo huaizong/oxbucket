@@ -18,7 +18,8 @@
 
 use std::{
     env, fs,
-    path::{Path, PathBuf},
+    // Aliased: `Path` (unqualified) below is axum's extractor, not this.
+    path::{Path as StdPath, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -58,8 +59,8 @@ async fn main() {
 
     let app = Router::new()
         .route("/", get(list_buckets))
-        .route("/:bucket", any(bucket_endpoint))
-        .route("/:bucket/*key", any(object_endpoint))
+        .route("/{bucket}", any(bucket_endpoint))
+        .route("/{bucket}/{*key}", any(object_endpoint))
         .fallback(unknown_resource)
         .with_state(AppState { data_dir });
 
@@ -362,7 +363,7 @@ fn is_valid_bucket_name(name: &str) -> bool {
 
 /// CreationDate for a bucket directory: birth time when available, falling
 /// back to mtime, rendered as ISO 8601 (`2006-03-01T17:45:09Z`).
-fn bucket_creation_date(dir: &Path) -> String {
+fn bucket_creation_date(dir: &StdPath) -> String {
     let secs = fs::metadata(dir)
         .ok()
         .and_then(|md| md.created().or_else(|_| md.modified()).ok())
