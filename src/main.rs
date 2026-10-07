@@ -22,6 +22,7 @@ use std::{
     env, fs,
     // Aliased: `Path` (unqualified) below is axum's extractor, not this.
     path::{Path as StdPath, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -110,7 +111,12 @@ async fn list_buckets(State(state): State<AppState>) -> Response {
         let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
         if is_dir {
             if let Some(name) = entry.file_name().to_str() {
-                names.push(name.to_string());
+                // Dot-prefixed directories are server bookkeeping (the
+                // stage-6 `.uploads` state root), never buckets: S3 bucket
+                // names cannot start with '.'.
+                if !name.starts_with('.') {
+                    names.push(name.to_string());
+                }
             }
         }
     }
@@ -450,6 +456,7 @@ async fn object_endpoint(
     method: Method,
     State(state): State<AppState>,
     Path((bucket, key)): Path<(String, String)>,
+    RawQuery(query): RawQuery,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -465,6 +472,43 @@ async fn object_endpoint(
         )
         .into_response();
     }
+
+    // Stage 6: multipart requests are plain object routes whose query string
+    // carries the marker parameters (`?uploads`, `?partNumber=N&uploadId=X`,
+    // `?uploadId=X`). Without those markers the request falls through to the
+    // plain object operations below.
+    let mp = MultipartQuery::parse(query.as_deref());
+    let resource = format!("/{bucket}/{key}");
+    if method == Method::POST && mp.uploads {
+        return initiate_multipart(&state, &bucket, &key);
+    }
+    if method == Method::POST {
+        if let Some(upload_id) = &mp.upload_id {
+            return complete_multipart(&state, &bucket, &key, upload_id, &body, &resource);
+        }
+    }
+    if method == Method::PUT {
+        if let Some(upload_id) = &mp.upload_id {
+            return match mp.part_number {
+                Some(part_number) => {
+                    upload_part(&state, upload_id, part_number, &body, &resource)
+                }
+                None => ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidArgument",
+                    "Part number must be an integer between 1 and 10000, inclusive",
+                    resource,
+                )
+                .into_response(),
+            };
+        }
+    }
+    if method == Method::DELETE {
+        if let Some(upload_id) = &mp.upload_id {
+            return abort_multipart(&state, upload_id, &resource);
+        }
+    }
+
     // Explicit dispatch, mirroring bucket_endpoint, so HEAD never falls back
     // to the GET handler.
     if method == Method::PUT {
@@ -699,6 +743,292 @@ fn delete_object(state: &AppState, bucket: &str, key: &str) -> Response {
         }
     }
     empty_response(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
+// Multipart upload (stage 6)
+// ---------------------------------------------------------------------------
+
+/// Query-string markers that turn an object request into a multipart one
+/// (`?uploads`, `?partNumber=N&uploadId=X`, `?uploadId=X`). Valueless
+/// parameters (like `uploads`) only mark presence; both sides of the SigV4
+/// check canonicalize them the same way (`k=` form), so signatures are
+/// unaffected.
+struct MultipartQuery {
+    uploads: bool,
+    part_number: Option<u32>,
+    upload_id: Option<String>,
+}
+
+impl MultipartQuery {
+    fn parse(query: Option<&str>) -> Self {
+        let mut q = MultipartQuery {
+            uploads: false,
+            part_number: None,
+            upload_id: None,
+        };
+        let Some(query) = query else { return q };
+        for pair in query.split('&') {
+            let (name, value) = match pair.split_once('=') {
+                Some((n, v)) => (n, percent_decode(v)),
+                None => (pair, String::new()),
+            };
+            match name {
+                "uploads" => q.uploads = true,
+                "partNumber" => q.part_number = value.parse().ok(),
+                "uploadId" => q.upload_id = Some(value),
+                _ => {}
+            }
+        }
+        q
+    }
+}
+
+/// Root of the in-flight multipart state, under the data dir. Dot-prefixed
+/// so it can never collide with a bucket name (S3 names cannot start with
+/// '.') and is skipped by ListBuckets.
+fn uploads_root(state: &AppState) -> PathBuf {
+    state.data_dir.join(".uploads")
+}
+
+/// One directory per upload, holding a `part-<N>` file per uploaded part.
+fn upload_dir(state: &AppState, upload_id: &str) -> PathBuf {
+    uploads_root(state).join(upload_id)
+}
+
+fn part_path(state: &AppState, upload_id: &str, part_number: u32) -> PathBuf {
+    upload_dir(state, upload_id).join(format!("part-{part_number}"))
+}
+
+/// Upload ids are minted by [`new_upload_id`] (hex digits + '-'); enforcing
+/// that shape here keeps ids that are joined onto paths free of separators
+/// and `..`.
+fn is_valid_upload_id(upload_id: &str) -> bool {
+    !upload_id.is_empty() && upload_id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
+}
+
+/// Mint a unique upload id: wall-clock nanos plus a process-lifetime
+/// sequence, hex + '-' — URL-safe so it can be echoed back verbatim.
+fn new_upload_id() -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("{nanos:016x}-{seq:04x}")
+}
+
+fn no_such_upload(resource: String) -> Response {
+    ApiError::new(
+        StatusCode::NOT_FOUND,
+        "NoSuchUpload",
+        "The specified upload does not exist. The upload ID may be invalid, \
+         or the upload may have been aborted or completed.",
+        resource,
+    )
+    .into_response()
+}
+
+fn invalid_part(resource: &str) -> Response {
+    ApiError::new(
+        StatusCode::BAD_REQUEST,
+        "InvalidPart",
+        "One or more of the specified parts could not be found. The part may \
+         not have been uploaded, or the specified entity tag may not match \
+         the part's entity tag.",
+        resource,
+    )
+    .into_response()
+}
+
+/// POST /<bucket>/<key>?uploads — InitiateMultipartUpload: mint the id,
+/// create its state directory, echo the id back verbatim in the result XML.
+fn initiate_multipart(state: &AppState, bucket: &str, key: &str) -> Response {
+    let upload_id = new_upload_id();
+    if let Err(err) = fs::create_dir_all(upload_dir(state, &upload_id)) {
+        return internal_error("could not create multipart upload directory", err);
+    }
+    xml_response(
+        StatusCode::OK,
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <InitiateMultipartUploadResult xmlns=\"{XML_NS}\">\
+             <Bucket>{}</Bucket>\
+             <Key>{}</Key>\
+             <UploadId>{}</UploadId>\
+             </InitiateMultipartUploadResult>",
+            xml_escape(bucket),
+            xml_escape(key),
+            xml_escape(&upload_id)
+        ),
+    )
+}
+
+/// PUT /<bucket>/<key>?partNumber=N&uploadId=X — UploadPart: store the part
+/// bytes under the upload's directory, answer 200 with the quoted md5-hex
+/// ETag of the part bytes (the stage-3 header convention).
+fn upload_part(
+    state: &AppState,
+    upload_id: &str,
+    part_number: u32,
+    body: &[u8],
+    resource: &str,
+) -> Response {
+    if !(1..=10_000).contains(&part_number) {
+        return ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "InvalidArgument",
+            "Part number must be an integer between 1 and 10000, inclusive",
+            resource,
+        )
+        .into_response();
+    }
+    if !is_valid_upload_id(upload_id) || !upload_dir(state, upload_id).is_dir() {
+        return no_such_upload(resource.to_string());
+    }
+    if let Err(err) = fs::write(part_path(state, upload_id, part_number), body) {
+        return internal_error("could not write part", err);
+    }
+    let mut res = empty_response(StatusCode::OK);
+    res.headers_mut()
+        .insert(header::ETAG, quoted_etag(&md5::md5_hex(body)));
+    res
+}
+
+/// POST /<bucket>/<key>?uploadId=X — CompleteMultipartUpload.
+///
+/// Pinned by tests/multipart_tests.rs: the body lists `<Part>` entries
+/// (PartNumber + ETag); the object is assembled from the stored parts in
+/// list order; the final ETag is `md5(concat part-md5-hex)-<part count>`
+/// (owner-pinned formula: md5 over the concatenated hex digests). A listed
+/// part that was never uploaded, or whose ETag does not match the stored
+/// bytes, is a 400 InvalidPart; an unknown or aborted upload id is a 404
+/// NoSuchUpload. Success removes the upload state and writes the object
+/// bytes plus the usual `.meta.json` sidecar, so plain GET/HEAD serve the
+/// assembled object.
+fn complete_multipart(
+    state: &AppState,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    body: &[u8],
+    resource: &str,
+) -> Response {
+    if !is_valid_upload_id(upload_id) || !upload_dir(state, upload_id).is_dir() {
+        return no_such_upload(resource.to_string());
+    }
+    let parts = parse_parts_list(body);
+    if parts.is_empty() {
+        return ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            "You must specify at least one part",
+            resource,
+        )
+        .into_response();
+    }
+
+    // Validate every listed part against the stored bytes before touching
+    // the destination object.
+    let mut assembled = Vec::new();
+    let mut digest_input = String::new();
+    for (part_number, etag) in &parts {
+        let bytes = match fs::read(part_path(state, upload_id, *part_number)) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return invalid_part(resource);
+            }
+            Err(err) => return internal_error("could not read part", err),
+        };
+        let md5_hex = md5::md5_hex(&bytes);
+        if md5_hex != *etag {
+            return invalid_part(resource);
+        }
+        digest_input.push_str(&md5_hex);
+        assembled.extend_from_slice(&bytes);
+    }
+
+    let final_etag = format!("{}-{}", md5::md5_hex(digest_input.as_bytes()), parts.len());
+
+    let path = object_path(state, bucket, key);
+    if let Some(parent) = path.parent() {
+        if let Err(err) = fs::create_dir_all(parent) {
+            return internal_error("could not create object directory", err);
+        }
+    }
+    if let Err(err) = fs::write(&path, &assembled) {
+        return internal_error("could not write assembled object", err);
+    }
+    let meta = ObjectMeta {
+        etag: final_etag.clone(),
+        content_type: DEFAULT_CONTENT_TYPE.to_string(),
+    };
+    if let Err(err) = write_meta(&meta_path(state, bucket, key), &meta) {
+        return internal_error("could not write object metadata", err);
+    }
+    // The upload is finished; drop its state directory.
+    if let Err(err) = fs::remove_dir_all(upload_dir(state, upload_id)) {
+        return internal_error("could not remove multipart upload state", err);
+    }
+    xml_response(
+        StatusCode::OK,
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <CompleteMultipartUploadResult xmlns=\"{XML_NS}\">\
+             <Bucket>{}</Bucket>\
+             <Key>{}</Key>\
+             <ETag>{}</ETag>\
+             </CompleteMultipartUploadResult>",
+            xml_escape(bucket),
+            xml_escape(key),
+            xml_escape(&final_etag)
+        ),
+    )
+}
+
+/// DELETE /<bucket>/<key>?uploadId=X — AbortMultipartUpload: remove the
+/// upload state, answer 204. A later complete on the same id is a 404
+/// NoSuchUpload.
+fn abort_multipart(state: &AppState, upload_id: &str, resource: &str) -> Response {
+    if !is_valid_upload_id(upload_id) || !upload_dir(state, upload_id).is_dir() {
+        return no_such_upload(resource.to_string());
+    }
+    if let Err(err) = fs::remove_dir_all(upload_dir(state, upload_id)) {
+        return internal_error("could not remove multipart upload state", err);
+    }
+    empty_response(StatusCode::NO_CONTENT)
+}
+
+/// Parse the `<Part><PartNumber>N</PartNumber><ETag>…</ETag></Part>` list
+/// out of a CompleteMultipartUpload body, in document order. Lenient about
+/// quotes: the tests interpolate the bare hex ETag they trimmed out of the
+/// UploadPart response header.
+fn parse_parts_list(body: &[u8]) -> Vec<(u32, String)> {
+    let text = String::from_utf8_lossy(body).into_owned();
+    let mut parts = Vec::new();
+    let mut rest: &str = &text;
+    while let Some(start) = rest.find("<Part>") {
+        let after = &rest[start + "<Part>".len()..];
+        let Some(end) = after.find("</Part>") else { break };
+        let block = &after[..end];
+        if let (Some(number), Some(etag)) = (
+            xml_text(block, "PartNumber").and_then(|t| t.trim().parse().ok()),
+            xml_text(block, "ETag").map(|t| t.trim().trim_matches('"').to_string()),
+        ) {
+            parts.push((number, etag));
+        }
+        rest = &after[end + "</Part>".len()..];
+    }
+    parts
+}
+
+/// Text of the first `<tag>…</tag>` element inside `block`.
+fn xml_text(block: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let start = block.find(open.as_str())? + open.len();
+    let len = block[start..].find('<')?;
+    Some(block[start..start + len].to_string())
 }
 
 /// Anything else — keep the pinned invariant that errors are XML documents.
