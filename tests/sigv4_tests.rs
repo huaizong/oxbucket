@@ -38,8 +38,9 @@ impl Drop for Svc {
 
 // Minimal SigV4 signer (header auth, UNSIGNED-PAYLOAD).
 fn hmac(key: &[u8], msg: &[u8]) -> Vec<u8> {
-    use sha2::{Digest, Hmac, Sha256};
-    let mut m = <Hmac<Sha256> as hmac::Mac>::new_from_slice(key).unwrap();
+    use hmac::{Hmac, Mac};
+    use sha2::{Digest, Sha256};
+    let mut m = <Hmac<Sha256> as Mac>::new_from_slice(key).unwrap();
     m.update(msg);
     m.finalize().into_bytes().to_vec()
 }
